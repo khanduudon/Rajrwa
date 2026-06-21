@@ -64,9 +64,159 @@ app.get('/segment', async (req, res) => {
   }
 });
 
-// -------------------- PDF VIEWER ROUTE (unchanged) --------------------
-app.get('/pdf', async (req, res) => { /* ... same as original ... */ });
-app.get('/pdf-viewer', async (req, res) => { /* ... same as original ... */ });
+// ── /pdf → CORS Proxy for PDFs (server-side fetch) ──────────────
+app.get('/pdf', async (req, res) => {
+  let pdfUrl = req.query.url || '';
+  if (!pdfUrl) return res.status(400).send('Missing url parameter');
+
+  // 🔧 Clean control characters (0x00–0x1F) from URL
+  pdfUrl = pdfUrl.replace(/[\x00-\x1F]+/g, '').trim();
+
+  try {
+    const response = await axios.get(pdfUrl, {
+      responseType: 'stream',
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125',
+        'Referer': 'https://static-db-v2.appx.co.in/',
+        'Accept': 'application/pdf,*/*',
+      },
+    });
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    // Forward relevant headers
+    if (response.headers['content-length'])
+      res.setHeader('Content-Length', response.headers['content-length']);
+
+    response.data.pipe(res);
+  } catch (err) {
+    console.error('PDF proxy error:', err.message);
+    res.status(502).send('PDF fetch failed: ' + err.message);
+  }
+});
+
+// ── /pdf-viewer → HTML PDF viewer (uses /pdf proxy) ──────────
+app.get('/pdf-viewer', (req, res) => {
+  let pdfUrl = req.query.url || '';
+  if (!pdfUrl) return res.status(400).send('Missing url parameter');
+
+  // Clean control chars
+  pdfUrl = pdfUrl.replace(/[\x00-\x1F]+/g, '').trim();
+
+  // ⚡ Route through /pdf proxy to bypass CORS
+  const proxiedUrl = '/pdf?url=' + encodeURIComponent(pdfUrl);
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>PDF Viewer — RWA</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{width:100%;height:100%;overflow:hidden;background:#1a1a1a;font-family:system-ui,sans-serif}
+    #viewer-container{width:100%;height:100%;display:flex;flex-direction:column}
+    #toolbar{
+      background:linear-gradient(135deg,#1e1e2e,#2d2d44);
+      padding:10px 16px;display:flex;align-items:center;justify-content:space-between;
+      box-shadow:0 2px 10px rgba(0,0,0,0.4);z-index:10;flex-shrink:0;
+    }
+    #toolbar .title{color:#fff;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+    #toolbar .title::before{content:'📄';font-size:16px}
+    #toolbar .actions{display:flex;gap:8px}
+    #toolbar button{
+      background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.15);
+      color:#fff;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px;
+      transition:all 0.2s;display:flex;align-items:center;gap:5px;
+    }
+    #toolbar button:hover{background:rgba(255,255,255,0.2);transform:translateY(-1px)}
+    #loading{
+      position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;
+      flex-direction:column;align-items:center;justify-content:center;
+      color:#fff;z-index:100;gap:16px;
+    }
+    #loading .spinner{
+      width:48px;height:48px;border:4px solid rgba(255,255,255,0.15);
+      border-top-color:#ff2d55;border-radius:50%;animation:spin 0.8s linear infinite;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
+    #loading .msg{font-size:14px;opacity:0.8}
+    iframe{flex:1;width:100%;border:none;background:#525659}
+    #error{
+      position:fixed;inset:0;background:#1a1a1a;color:#ff4444;
+      display:none;flex-direction:column;align-items:center;justify-content:center;
+      gap:12px;font-size:15px;z-index:200;
+    }
+    #error .icon{font-size:48px}
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div class="msg">Loading PDF...</div>
+  </div>
+  <div id="error">
+    <div class="icon">⚠️</div>
+    <div id="error-msg">Failed to load PDF</div>
+    <button onclick="location.reload()" style="margin-top:10px;padding:8px 20px;background:#ff2d55;color:#fff;border:none;border-radius:6px;cursor:pointer">Retry</button>
+  </div>
+
+  <div id="viewer-container">
+    <div id="toolbar">
+      <div class="title">PDF Document</div>
+      <div class="actions">
+        <button onclick="downloadPdf()">⬇ Download</button>
+        <button onclick="openNew()">↗ Open</button>
+      </div>
+    </div>
+    <iframe id="pdf-frame" src="${proxiedUrl}" allowfullscreen></iframe>
+  </div>
+
+  <script>
+    const frame = document.getElementById('pdf-frame');
+    const loading = document.getElementById('loading');
+    const errorDiv = document.getElementById('error');
+    const errorMsg = document.getElementById('error-msg');
+    const pdfUrl = \`${pdfUrl.replace(/'/g, "\\'")}\`;
+
+    frame.onload = () => { loading.style.display = 'none'; };
+    frame.onerror = () => { showError('PDF failed to load'); };
+
+    // Timeout fallback
+    setTimeout(() => {
+      if (loading.style.display !== 'none') {
+        try {
+          if (!frame.contentWindow.document.body.innerHTML) showError('Timeout');
+        } catch(e) { loading.style.display = 'none'; }
+      }
+    }, 15000);
+
+    function showError(msg) {
+      loading.style.display = 'none';
+      errorMsg.textContent = msg;
+      errorDiv.style.display = 'flex';
+    }
+
+    function downloadPdf() {
+      const a = document.createElement('a');
+      a.href = '/pdf?url=' + encodeURIComponent(pdfUrl);
+      a.download = 'document.pdf';
+      a.click();
+    }
+
+    function openNew() {
+      window.open('/pdf?url=' + encodeURIComponent(pdfUrl), '_blank');
+    }
+  </script>
+</body>
+</html>`;
+
+  res.send(html);
+});
 
 // ==================== GOD-LEVEL PLAYER ====================
 app.get('/player', (req, res) => {
